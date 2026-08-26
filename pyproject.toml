@@ -1,0 +1,50 @@
+[project]
+name = "openpilot-distill"
+version = "0.1.0"
+description = "Driving-segment localization and policy-learning experiments"
+readme = "README.md"
+requires-python = ">=3.12.3,<3.13"
+license = {text = "MIT"}
+dependencies = [
+  "av",
+  "comma-deps-raylib",
+  "dill",
+  "einops>=0.8",
+  "fastapi",
+  "huggingface-hub",
+  "numpy>=2.0",
+  "opencv-python-headless",
+  "openpilot @ https://github.com/commaai/openpilot/archive/084747c75d2cbd23af65ab7a9e770bbd7b98bac9.tar.gz",
+  "opendbc @ https://github.com/commaai/opendbc/archive/7343a66d46213d5f73528afc6c6db713ebd88a9d.tar.gz",
+  "pynvvideocodec>=2.1",
+  "safetensors",
+  "spmd-types==0.2.1",
+  "torch==2.13.0",
+  "torchao",
+  "torchtitan",
+  "torchvision",
+  "uvicorn",
+  "timm >=0.9.8",
+  "reverse_geocoder",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.11",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torchtitan = { workspace = true }
+
+[tool.uv.workspace]
+members = ["torchtitan"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "C4", "PIE", "UP"]

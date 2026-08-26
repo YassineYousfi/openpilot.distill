@@ -1,0 +1,3 @@
+[submodule "torchtitan"]
+	path = torchtitan
+	url = https://github.com/commaai/torchtitan
