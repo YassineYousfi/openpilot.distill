@@ -230,7 +230,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--segment", default=SEGMENT, help="segment ID under data/")
     parser.add_argument("--server", default=SERVER_URL, help="resident Runtime server URL")
-    parser.add_argument("--sampling-steps", type=int, default=30, help="diffusion steps per generated frame")
+    parser.add_argument("--sampling-steps", type=int, default=15, help="diffusion steps per generated frame")
     parser.add_argument("--cfg", type=float, default=2.0, help="classifier-free guidance scale")
     parser.add_argument("--actor", choices=("wasd", "supercombo"), default="wasd")
     parser.add_argument("--on-policy", type=Path, help="finetuned on-policy state dict")

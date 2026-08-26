@@ -6,15 +6,15 @@ With a comma four, and a few logged segments, fine-tune the openpilot driving mo
 
 Drop your segments video files and rlogs into the `data/` folder.
 
-## Step 1: Run a simple localization pipeline.
+## Step 1: Run a simple localization pipeline
 
 Run the localizer.
 
-## Step 2: Fine tune the driving model using supervised learning.
+## Step 2: Fine tune the driving model using supervised learning
 
 Fine tune the driving model using localized plan and image auto-encoder losses.
 
-## Step 3: Fine tune the driving model in the simulator.
+## Step 3: Fine tune the driving model in the simulator
 
 DAgger style fine tuning using a learned world model.
 

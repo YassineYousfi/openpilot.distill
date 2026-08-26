@@ -34,7 +34,7 @@ class WASDActor:
     model_outputs = None
 
     def act(self, frame: np.ndarray | None = None, speed: float = 0.0) -> tuple[float, float]:
-        curvature = 0.005 * (rl.is_key_down(rl.KEY_A) - rl.is_key_down(rl.KEY_D))
+        curvature = 0.005 * (rl.is_key_down(rl.KEY_D) - rl.is_key_down(rl.KEY_A))
         accel = 0.5 * (rl.is_key_down(rl.KEY_W) - rl.is_key_down(rl.KEY_S))
         return curvature, accel
 
