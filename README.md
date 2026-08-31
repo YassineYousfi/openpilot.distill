@@ -10,9 +10,13 @@ Drop your segments video files and rlogs into the `data/` folder.
 
 Run the localizer.
 
+<img width="512" height="256" alt="2333e255f1de1fe83ea5975b24a3cc67_frame_700" src="https://github.com/user-attachments/assets/395683ff-7d96-4e07-bf6e-12a3969b487f" />
+
 ## Step 2: Fine tune the driving model using supervised learning
 
 Fine tune the driving model using localized plan and image auto-encoder losses.
+
+https://api.wandb.ai/links/yassiney/qme6ln4z
 
 ## Step 3: Fine tune the driving model in the simulator
 
