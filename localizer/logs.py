@@ -2,6 +2,7 @@ from collections import defaultdict
 import json
 from pathlib import Path
 
+import laika.raw_gnss as raw
 import numpy as np
 from openpilot.tools.lib.framereader import get_video_index
 
@@ -87,18 +88,12 @@ def read_log(messages, video_dir: Path) -> tuple[LocalizationInput, dict[str, np
     event for event in streams["gpsLocationExternal"]
     if event.valid and event.gpsLocationExternal.hasFix
   ]
-  if device_types != {"mici"} or len(gps_events) < 2:
+  if device_types != {"mici"} or not gps_events:
     raise ValueError(SUPPORTED_LOG)
 
-  clock = next((
-    (event.logMonoTime, event.clocks.wallTimeNanos)
-    for event in streams["clocks"] if event.valid and event.clocks.wallTimeNanos
-  ), None)
   missing = [
     name for name in (POSE_STREAM, CALIBRATION_STREAM, *CAMERA_STREAMS.values()) if not streams[name]
   ]
-  if clock is None:
-    missing.append("clocks")
   if missing:
     raise RuntimeError(f"missing required log streams: {', '.join(missing)}")
 
@@ -120,22 +115,24 @@ def read_log(messages, video_dir: Path) -> tuple[LocalizationInput, dict[str, np
   if not device_motion:
     raise RuntimeError(f"no valid {POSE_STREAM} stream found in the log")
 
-  gps_rows = []
+  gps_positions = []
   for event in gps_events:
     gps = event.gpsLocationExternal
-    velocity_ned = list(gps.vNED)
     position = [gps.latitude, gps.longitude, gps.altitude]
-    accuracy = [gps.horizontalAccuracy, gps.horizontalAccuracy, gps.verticalAccuracy]
-    if (
-      len(velocity_ned) != 3
-      or gps.unixTimestampMillis <= 0
-      or not np.all(np.isfinite(position + velocity_ned + accuracy))
-      or min(accuracy) <= 0.0
-    ):
-      raise RuntimeError(
-        "gpsLocationExternal requires a UTC timestamp, finite position, positive accuracy, and 3D vNED"
-      )
-    gps_rows.append((gps.unixTimestampMillis, position, velocity_ned, accuracy))
+    if not np.all(np.isfinite(position)):
+      raise RuntimeError("gpsLocationExternal requires a finite position")
+    gps_positions.append(position)
+
+  raw_gnss_t = []
+  raw_gnss_measurements = []
+  for event in streams["ubloxGnss"]:
+    if not event.valid or event.ubloxGnss.which() != "measurementReport":
+      continue
+    for measurement in raw.read_raw_ublox(event.ubloxGnss.measurementReport):
+      raw_gnss_t.append(event.logMonoTime * 1e-9)
+      raw_gnss_measurements.append(raw.array_from_normal_meas(measurement))
+  if not raw_gnss_measurements:
+    raise RuntimeError("no raw UBlox measurement reports found in the log")
 
   calibration_values = wide_values = None
   last_valid_blocks = None
@@ -176,11 +173,9 @@ def read_log(messages, video_dir: Path) -> tuple[LocalizationInput, dict[str, np
     velocity_std=np.asarray([row[3] for row in device_motion]),
     acceleration_device=np.asarray([row[4] for row in device_motion]),
     angular_velocity_device=np.asarray([row[5] for row in device_motion]),
-    gps_unix_ms=np.asarray([row[0] for row in gps_rows], dtype=np.int64),
-    gps_geodetic=np.asarray([row[1] for row in gps_rows]),
-    gps_velocity_ned=np.asarray([row[2] for row in gps_rows]),
-    gps_position_std=np.asarray([row[3] for row in gps_rows]),
-    clock=np.asarray(clock, dtype=np.int64),
+    gps_seed_geodetic=np.asarray(gps_positions[0]),
+    raw_gnss_t=np.asarray(raw_gnss_t),
+    raw_gnss_measurements=np.asarray(raw_gnss_measurements),
     calibration=calibration_values,
     wide_from_device_euler=wide_values,
     frame_t=frame_info["fcamera/t"],

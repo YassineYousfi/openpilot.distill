@@ -4,17 +4,18 @@ import cv2
 import numpy as np
 import pyray as rl
 import torch
-import torch.distributed.checkpoint as dcp
-from torchtitan.experiments.path.model_constants import (
-    DESIRE_LEN,
-    ModelInputs,
-    SUPERCOMBO_FPS as FPS,
-    frame_constants_from_fps,
+
+from supervised.model import ModelInputs, Supercombo, SupercomboConfig, VisionConfig, rl_policies
+from supervised.model_for_inference import (
+    InputQueues,
+    ORTSupercomboForInference,
+    SupercomboForInference,
+    TorchSupercomboForInference,
 )
-from torchtitan.experiments.rldriving.supercombo import Supercombo
 
 
-SUPERCOMBO = Path(__file__).resolve().parents[1] / "models/supercombo"
+FPS = 5
+SUPERCOMBO = Path(__file__).resolve().parents[1] / "models/big_driving_supercombo.onnx"
 
 
 class ConstantActor:
@@ -40,53 +41,68 @@ class WASDActor:
 
 
 class SupercomboActor:
-    """Run the local TorchTitan Supercombo checkpoint on rollout frames."""
+    """Run either the Torch or ONNX Supercombo one frame at a time."""
 
-    def __init__(self, on_policy: Path | None = None):
-        self.device = torch.device("cuda", torch.cuda.current_device())
-        default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(torch.bfloat16)
-        try:
-            self.model = Supercombo()
-        finally:
-            torch.set_default_dtype(default_dtype)
+    @classmethod
+    def from_torch(cls, model: Supercombo) -> "SupercomboActor":
+        return cls(TorchSupercomboForInference(model))
 
-        dcp.load(
-            {
-                "vision": self.model.vision,
-                "point_policy": self.model.point_policy,
-                "temporal_policy": self.model.off_policy,
-            },
-            checkpoint_id=SUPERCOMBO,
-            no_dist=True,
+    @classmethod
+    def from_torch_checkpoint(
+        cls,
+        checkpoint: str | Path,
+        *,
+        on_policy: str | Path | None = None,
+        device: torch.device | str | None = None,
+    ) -> "SupercomboActor":
+        config = SupercomboConfig(vision=VisionConfig(pretrained=False))
+        model = Supercombo(config, rl_policies(config))
+        model.load_state_dict(torch.load(checkpoint, map_location="cpu", weights_only=True), strict=False)
+        temporal = model.temporal_policy.state_dict()
+        model.on_policy_temporal.load_state_dict(
+            {name: temporal[name] for name in model.on_policy_temporal.state_dict()}
         )
-        if on_policy is None:
-            off_policy = self.model.off_policy.state_dict()
-            state = {name: off_policy[name] for name in self.model.on_policy.state_dict()}
-        else:
-            state = torch.load(on_policy, map_location="cpu", weights_only=True)
-        self.model.on_policy.load_state_dict(state, strict=True)
-        self.model.to(self.device).eval()
-
-        constants = frame_constants_from_fps(FPS)
-        spatial_size = self.model.off_policy.temporal_summarizer.spatial_size
-        vision_features = self.model.vision.config.vision_features
-        dtype = next(self.model.parameters()).dtype
-        self.features = torch.zeros(
-            1, constants["temporal_len"] - 1, spatial_size, vision_features, device=self.device, dtype=dtype
+        if on_policy is not None:
+            model.on_policy_temporal.load_state_dict(
+                torch.load(on_policy, map_location="cpu", weights_only=True)
+            )
+        device = device or (
+            torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
         )
-        self.desire = torch.zeros(1, constants["temporal_len"], DESIRE_LEN, device=self.device, dtype=dtype)
-        self.traffic = torch.tensor([[1.0, 0.0]], device=self.device, dtype=dtype)
-        self.action_t = torch.full((1, 2), 1 / FPS, device=self.device, dtype=dtype)
-        self.previous: dict[str, torch.Tensor] = {}
-        self.hidden_size = spatial_size * vision_features
+        return cls.from_torch(model.to(device).eval())
+
+    @classmethod
+    def from_onnx(
+        cls,
+        model: str | Path = SUPERCOMBO,
+        *,
+        providers: list[object] | None = None,
+    ) -> "SupercomboActor":
+        if providers is None:
+            providers = (
+                [("CUDAExecutionProvider", {"device_id": torch.cuda.current_device()}), "CPUExecutionProvider"]
+                if torch.cuda.is_available()
+                else ["CPUExecutionProvider"]
+            )
+        return cls(ORTSupercomboForInference.from_supercombo(model, providers=providers))
+
+    def __init__(self, model: SupercomboForInference):
+        self.model = model
+        self.queues = InputQueues.from_model(model)
+        self.previous: dict[str, np.ndarray] = {}
         self.model_inputs: dict[str, torch.Tensor] | None = None
         self.model_outputs: dict[str, torch.Tensor] | None = None
         self.reset()
 
+    @staticmethod
+    def _cpu(value: np.ndarray | torch.Tensor) -> torch.Tensor:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().clone()
+        return torch.from_numpy(np.array(value, copy=True))
+
     @torch.inference_mode()
     def reset(self) -> None:
-        self.features.zero_()
+        self.queues.reset()
         self.previous.clear()
         self.action = (0.0, 0.0)
         self.model_inputs = None
@@ -108,34 +124,36 @@ class SupercomboActor:
             tensor[3] = yuv[1:256:2, 1::2]
             tensor[4] = yuv[256:320].reshape(128, 256)
             tensor[5] = yuv[320:384].reshape(128, 256)
-            current_images[name] = torch.from_numpy(tensor).to(self.device)
+            current_images[name] = tensor
         if not self.previous:
             self.previous = current_images
             return self.action
 
-        inputs: dict[str, torch.Tensor] = {
-            name: torch.cat((self.previous[name], current))[None] for name, current in current_images.items()
+        inputs = {
+            name: np.concatenate((self.previous[name], current), axis=0)[None]
+            for name, current in current_images.items()
         }
         self.previous = current_images
-        inputs.update(
-            {
-                "features_buffer": self.features,
-                ModelInputs.DESIRE: self.desire,
-                ModelInputs.TRAFFIC: self.traffic,
-                ModelInputs.ACTION_T: self.action_t,
-            }
-        )
-
-        output = self.model(inputs) # TODO: this should be a dict
-        tail = output[:, -(4 + self.hidden_size + self.model.pad.shape[1]) :]
-        lat_accel, accel = tail[0, :2].float().cpu().tolist()
-        self.model_inputs = {name: value.detach().cpu() for name, value in inputs.items()}
-        self.model_outputs = {
-            "outputs": output.detach().cpu(),
-            "action": tail[:, :4].detach().cpu(),
-            "vision_features": tail[:, 4 : 4 + self.hidden_size].reshape_as(self.features[:, -1]).detach().cpu(),
+        if self.model.backend == "torch":
+            inputs = {name: torch.from_numpy(value).to(self.queues.device) for name, value in inputs.items()}
+        inputs |= {
+            ModelInputs.DESIRE: np.zeros((1, 8), dtype=np.float32),
+            ModelInputs.TRAFFIC: np.array([[1.0, 0.0]], dtype=np.float32),
+            ModelInputs.ACTION_T: np.full((1, 2), 1 / FPS, dtype=np.float32),
         }
-        self.features = torch.roll(self.features, -1, dims=1)
-        self.features[:, -1] = tail[:, 4 : 4 + self.hidden_size].reshape_as(self.features[:, -1])
+
+        features = self._cpu(self.queues.q[ModelInputs.FEATURES])
+        outputs = self.model.decode(inputs, self.queues)
+        self.model_inputs = {
+            **{name: self._cpu(inputs[name]) for name in self.model.image_names},
+            ModelInputs.FEATURES: features,
+            **{
+                name: self._cpu(self.queues.q[name])
+                for name in (ModelInputs.DESIRE, ModelInputs.TRAFFIC, ModelInputs.ACTION_T)
+            },
+        }
+        self.model_outputs = {name: self._cpu(value) for name, value in outputs.items()}
+
+        lat_accel, accel = self.model_outputs["action"][0, :2].float().tolist()
         self.action = (lat_accel / max(speed, 1.0) ** 2, accel)
         return self.action

@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .gnss import localize_raw_gnss
 from .math import (
   circular_offset,
   ecef_to_geodetic,
@@ -25,11 +26,9 @@ class LocalizationInput:
   velocity_std: np.ndarray
   acceleration_device: np.ndarray
   angular_velocity_device: np.ndarray
-  gps_unix_ms: np.ndarray
-  gps_geodetic: np.ndarray
-  gps_velocity_ned: np.ndarray
-  gps_position_std: np.ndarray
-  clock: np.ndarray
+  gps_seed_geodetic: np.ndarray
+  raw_gnss_t: np.ndarray
+  raw_gnss_measurements: np.ndarray
   calibration: np.ndarray
   wide_from_device_euler: np.ndarray
   frame_t: np.ndarray
@@ -100,7 +99,10 @@ def _rts_trajectory(pose_t: np.ndarray, velocity: np.ndarray, velocity_covarianc
 
 
 def _globalize_live_pose(
-  data: LocalizationInput, gps_t: np.ndarray
+  data: LocalizationInput,
+  gps_t: np.ndarray,
+  gps_position_ecef: np.ndarray,
+  gps_velocity_ecef: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
   calibration = data.calibration
   device_from_calibrated = euler_to_rot(calibration[None])[0]
@@ -110,8 +112,11 @@ def _globalize_live_pose(
   gps_orientation = interpolate(gps_t, data.pose_t, np.unwrap(data.orientation, axis=0))
   local_from_calibrated = euler_to_rot(gps_orientation) @ device_from_calibrated
   local_heading = np.arctan2(local_from_calibrated[:, 1, 0], local_from_calibrated[:, 0, 0])
-  gps_heading = np.arctan2(data.gps_velocity_ned[:, 1], data.gps_velocity_ned[:, 0])
-  gps_speed = np.linalg.norm(data.gps_velocity_ned[:, :2], axis=1)
+  gps_geodetic = ecef_to_geodetic(gps_position_ecef)
+  gps_ned_from_ecef = ned_from_ecef_matrix(gps_geodetic)
+  gps_velocity_ned = np.einsum("kij,kj->ki", gps_ned_from_ecef, gps_velocity_ecef)
+  gps_heading = np.arctan2(gps_velocity_ned[:, 1], gps_velocity_ned[:, 0])
+  gps_speed = np.linalg.norm(gps_velocity_ned[:, :2], axis=1)
   moving = np.isfinite(gps_heading) & (gps_speed > 5.0)
   if np.count_nonzero(moving) < 2 or np.ptp(gps_t[moving]) < 0.5:
     raise RuntimeError("global yaw needs at least two moving GPS fixes spanning 0.5 seconds")
@@ -142,18 +147,18 @@ def _globalize_live_pose(
     ned_from_device @ velocity_covariance_device @ ned_from_device.swapaxes(1, 2)
   )
 
-  origin_ecef = geodetic_to_ecef(data.gps_geodetic[:1])[0]
-  origin_ned_from_ecef = ned_from_ecef_matrix(data.gps_geodetic[:1])[0]
-  gps_ecef = geodetic_to_ecef(data.gps_geodetic)
-  gps_position_ned = np.einsum("ij,kj->ki", origin_ned_from_ecef, gps_ecef - origin_ecef)
+  origin_ecef = gps_position_ecef[0]
+  origin_ned_from_ecef = gps_ned_from_ecef[0]
+  gps_position_ned = np.einsum("ij,kj->ki", origin_ned_from_ecef, gps_position_ecef - origin_ecef)
+  gps_velocity_ned = np.einsum("ij,kj->ki", origin_ned_from_ecef, gps_velocity_ecef)
   position_ned, velocity_ned = _rts_trajectory(
     data.pose_t,
     velocity_ned,
     velocity_covariance_ned,
     gps_t=gps_t,
     gps_position=gps_position_ned,
-    gps_position_std=data.gps_position_std,
-    gps_velocity=data.gps_velocity_ned,
+    gps_position_std=np.ones_like(gps_position_ned),
+    gps_velocity=gps_velocity_ned,
   )
   position_ecef = origin_ecef + np.einsum("ij,kj->ki", origin_ned_from_ecef.T, position_ned)
   velocity_ecef = np.einsum("ij,kj->ki", origin_ned_from_ecef.T, velocity_ned)
@@ -164,13 +169,21 @@ def _globalize_live_pose(
 
 
 def localize(data: LocalizationInput, output_hz: float = 100.0) -> dict[str, np.ndarray]:
-  mono_from_unix_ns = data.clock[0] - data.clock[1]
-  gps_t = (data.gps_unix_ms * 1_000_000 + mono_from_unix_ns) * 1e-9
-  for name, values in (("deviceMotion", data.pose_t), ("GPS", gps_t), ("road-camera", data.frame_t)):
+  initial_position = geodetic_to_ecef(data.gps_seed_geodetic[None])[0]
+  gps_t, gps_position, gps_velocity = localize_raw_gnss(
+    data.raw_gnss_t, data.raw_gnss_measurements, initial_position
+  )
+  for name, values in (
+    ("deviceMotion", data.pose_t),
+    ("raw GPS", gps_t),
+    ("road-camera", data.frame_t),
+  ):
     if not len(values) or not np.all(np.isfinite(values)) or np.any(np.diff(values) <= 0.0):
       raise RuntimeError(f"{name} timestamps must be finite and strictly increasing")
   frame_t = np.asarray(data.frame_t, dtype=np.float64)
-  position, velocity, quaternions, acceleration = _globalize_live_pose(data, gps_t)
+  position, velocity, quaternions, acceleration = _globalize_live_pose(
+    data, gps_t, gps_position, gps_velocity
+  )
 
   start, end = frame_t[0], max(frame_t[-1], data.pose_t[-1])
   trajectory_t = np.arange(start, end + 0.5 / output_hz, 1.0 / output_hz)

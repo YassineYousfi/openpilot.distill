@@ -4,24 +4,26 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-import av
 import cv2
 import numpy as np
 import torch
 from openpilot.cereal import log
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, img_from_device
-from openpilot.common.transformations.model import get_warp_matrix, medmodel_intrinsics
+from openpilot.common.transformations.model import medmodel_intrinsics, sbigmodel_intrinsics
 from safetensors.numpy import load_file
 
-from rl.actor import ConstantActor, SupercomboActor, WASDActor
+from helpers.video_helpers import calibration_view_eulers, calibration_warp_matrix, decode_frames
+from rl.actor import SUPERCOMBO, ConstantActor, SupercomboActor, WASDActor
 from rl.server import SERVER_URL, RuntimeClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SEGMENT = "2333e255f1de1fe83ea5975b24a3cc67"
+CACHE_DIR = ROOT / "outputs/rl/cache"
 FPS = 5
 ROLLOUT_FRAMES = 50
 FRAME_SKIP = 20 // FPS
+ENCODE_BATCH_SIZE = 32
 CAMERAS = DEVICE_CAMERAS[("mici", "os04c10")]
 FCAM_INTRINSICS = medmodel_intrinsics * np.array([[0.5], [0.5], [1.0]])
 
@@ -43,50 +45,88 @@ def draw_worldmodel_outputs(frame: np.ndarray, plan: np.ndarray) -> np.ndarray:
         points = img_from_device(path)
         points = np.column_stack((points, np.ones(len(points)))) @ FCAM_INTRINSICS.T
         points = points[:, :2]
-        valid = (
-            np.isfinite(points).all(axis=1)
-            & (points >= 0).all(axis=1)
-            & (points < frame.shape[1::-1]).all(axis=1)
-        )
+        valid = np.isfinite(points).all(axis=1) & (points >= 0).all(axis=1) & (points < frame.shape[1::-1]).all(axis=1)
         if valid.sum() > 1:
             cv2.polylines(fcam, [points[valid].astype(np.int32)], False, (255, 80, 20), 2, cv2.LINE_AA)
     rendered[..., :3] = fcam
     return rendered
 
 
+def _load_cached_latents(path: Path) -> torch.Tensor | None:
+    if not path.exists():
+        return None
+    try:
+        return torch.from_numpy(np.load(path, allow_pickle=False))
+    except (EOFError, OSError, ValueError):
+        return None
+
+
+def _save_cached_latents(path: Path, latents: torch.Tensor) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp.npy")
+    np.save(temporary, latents.detach().cpu().float().numpy())
+    temporary.replace(path)
+
+
 class Episode:
     """Encoded segment data shared across rollouts."""
 
-    def __init__(self, runtime: RuntimeClient, segment: str = SEGMENT):
+    def __init__(
+        self,
+        runtime: RuntimeClient,
+        segment: str = SEGMENT,
+        gpu_id: int = 0,
+        encode_batch_size: int = ENCODE_BATCH_SIZE,
+        cache_dir: Path | None = None,
+    ):
+        if encode_batch_size <= 0:
+            raise ValueError("encode_batch_size must be positive")
         directory = ROOT / "data" / segment
         files = {
             name: directory / name
             for name in ("fcamera.hevc", "ecamera.hevc", "frame_info.safetensors", "localizer.safetensors")
         }
-        if int(load_file(files["frame_info.safetensors"])["device_type"].item()) != log.InitData.DeviceType.mici:
+        frame_info = load_file(files["frame_info.safetensors"])
+        if int(frame_info["device_type"].item()) != log.InitData.DeviceType.mici:
             raise ValueError("the v0 environment expects a comma four segment")
         localizer = load_file(files["localizer.safetensors"])
         calibration = localizer["rpy"]
         self.speeds = np.linalg.norm(localizer["frame_states"][::FRAME_SKIP, 7:10], axis=1)
 
+        cache_path = None
+        if cache_dir is not None:
+            vae_dir = runtime.vae.replace("/", "--")
+            cache_path = cache_dir / vae_dir / f"{segment}.npy"
+            cached = _load_cached_latents(cache_path)
+            if cached is not None and len(cached) == len(self.speeds):
+                self.latents = cached
+                print(f"loaded latent cache: {cache_path}")
+                return
+
+        view_euler = calibration_view_eulers(calibration)
         views = []
-        for name, source_k, bigmodel_frame in (
-            ("fcamera.hevc", CAMERAS.narrow_road.intrinsics, False),
-            ("ecamera.hevc", CAMERAS.wide_road.intrinsics, True),
+        for camera, source_k, target_k in (
+            ("fcamera", CAMERAS.narrow_road.intrinsics, medmodel_intrinsics),
+            ("ecamera", CAMERAS.wide_road.intrinsics, sbigmodel_intrinsics),
         ):
-            matrix = np.linalg.inv(get_warp_matrix(calibration, source_k, bigmodel_frame))
+            matrix = calibration_warp_matrix(source_k, target_k, view_euler)
             matrix[:2] *= 0.5
-            frames = []
-            with av.open(files[name], format="hevc") as video:
-                for frame_index, frame in enumerate(video.decode(video=0)):
-                    if frame_index % FRAME_SKIP == 0:
-                        image = frame.to_ndarray(format="rgb24")
-                        frames.append(cv2.warpPerspective(image, matrix, (256, 128), borderMode=cv2.BORDER_REPLICATE))
+            index = frame_info[f"{camera}/index"]
+            wanted = set(range(0, len(index) - 1, FRAME_SKIP))
+            decoded = decode_frames(files[f"{camera}.hevc"], index, wanted, gpu_id=gpu_id)
+            frames = [
+                cv2.warpPerspective(decoded[frame_index], matrix, (256, 128), borderMode=cv2.BORDER_REPLICATE)
+                for frame_index in sorted(wanted)
+            ]
             views.append(np.stack(frames))
 
         frames = np.concatenate(views, axis=-1)
-        self.latents = runtime.encode(frames)
-        self.frames = runtime.decode(self.latents)
+        self.latents = torch.cat(
+            [runtime.encode(frames[start : start + encode_batch_size]) for start in range(0, len(frames), encode_batch_size)]
+        )
+        if cache_path is not None:
+            _save_cached_latents(cache_path, self.latents)
+            print(f"wrote latent cache: {cache_path}")
 
 
 class Physics:
@@ -129,7 +169,7 @@ class Env:
         self.runtime = runtime
         self.start = self.target = start
         self.end = end
-        self.initial_frame = episode.frames[start_index - 1]
+        self.initial_frame = runtime.decode(episode.latents[start_index - 1 : start_index])[0]
         self.context = episode.latents[start_index - runtime.history_frames : start_index].clone()
         self.future = episode.latents[end_index : end_index + runtime.future_frames].clone()
         future_start = runtime.history_frames + end_index - start_index
@@ -232,39 +272,36 @@ def main() -> None:
     parser.add_argument("--server", default=SERVER_URL, help="resident Runtime server URL")
     parser.add_argument("--sampling-steps", type=int, default=15, help="diffusion steps per generated frame")
     parser.add_argument("--cfg", type=float, default=2.0, help="classifier-free guidance scale")
+    parser.add_argument("--gpu-id", type=int, default=0, help="GPU used for video decoding")
+    parser.add_argument("--encode-batch-size", type=int, default=ENCODE_BATCH_SIZE, help="VAE encoding batch size")
+    parser.add_argument("--cache-dir", type=Path, default=CACHE_DIR, help="optional latent cache directory")
     parser.add_argument("--actor", choices=("wasd", "supercombo"), default="wasd")
+    parser.add_argument("--model", type=Path, default=SUPERCOMBO, help="ONNX model or Torch state dict")
     parser.add_argument("--on-policy", type=Path, help="finetuned on-policy state dict")
     parser.add_argument("--start", type=int, help="first 20 Hz camera frame to dream")
     parser.add_argument("--end", type=int, help="exclusive 20 Hz frame")
-    parser.add_argument("-o", "--output", type=Path, default=Path("outputs/rl/worldmodel.mp4"), help="output video")
     args = parser.parse_args()
 
     runtime = RuntimeClient(args.server, args.sampling_steps, args.cfg)
-    episode = Episode(runtime, args.segment)
+    episode = Episode(
+        runtime,
+        args.segment,
+        gpu_id=args.gpu_id,
+        encode_batch_size=args.encode_batch_size,
+        cache_dir=args.cache_dir,
+    )
     env = Env(runtime, episode, args.start, args.end)
-    actor = SupercomboActor(args.on_policy) if args.actor == "supercombo" else WASDActor()
+    if args.actor == "supercombo":
+        actor = (
+            SupercomboActor.from_onnx(args.model)
+            if args.model.suffix == ".onnx"
+            else SupercomboActor.from_torch_checkpoint(args.model, on_policy=args.on_policy)
+        )
+    else:
+        actor = WASDActor()
     from rl.viewer import Viewer
 
-    sim = rollout(env, actor, Viewer(env.initial_frame))
-    simulated_frames = [
-        draw_worldmodel_outputs(frame, plan)
-        for frame, plan in zip(sim.worldmodel_outputs["frames"], sim.worldmodel_outputs["plan"], strict=True)
-    ]
-    frames = np.stack(
-        [
-            *episode.frames[env.start // FRAME_SKIP - runtime.history_frames : env.start // FRAME_SKIP],
-            *simulated_frames,
-        ]
-    )
-    frames = np.concatenate((frames[..., :3], frames[..., 3:]), axis=1)
-    with av.open(str(args.output), "w") as video:
-        stream = video.add_stream("libx264", rate=FPS)
-        stream.width, stream.height, stream.pix_fmt = frames.shape[2], frames.shape[1], "yuv420p"
-        for frame in frames:
-            for packet in stream.encode(av.VideoFrame.from_ndarray(frame, format="rgb24")):
-                video.mux(packet)
-        for packet in stream.encode():
-            video.mux(packet)
+    rollout(env, actor, Viewer(env.initial_frame))
 
 
 if __name__ == "__main__":

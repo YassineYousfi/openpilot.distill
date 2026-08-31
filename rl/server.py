@@ -27,14 +27,16 @@ FUTURE_FRAMES = 0
 
 
 class Runtime:
-    def __init__(self, model_path: Path, device: str):
+    def __init__(self, model_path: Path, vae: str, device: str):
         self.device = torch.device(device)
+        self.model_path = model_path
+        self.vae = vae
         if self.device.type != "cuda":
             raise ValueError("the v0 environment requires CUDA")
         if self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
 
-        importer = PackageImporter(str(model_path))
+        importer = PackageImporter(str(self.model_path))
         model_io = importer.load_pickle("meta", "meta.pkl")["model_io"]
         model_frames = model_io["in_shape"]["latents"][1]
         if model_frames <= FUTURE_FRAMES:
@@ -45,8 +47,12 @@ class Runtime:
         self.model_dtype = model_io["in_dtype"]["latents"]
         self.vae_dtype = torch.bfloat16
 
-        self.encoder = torch.export.load(hf_hub_download(VAE, "encoder.pt2")).module().to(self.device, self.vae_dtype)
-        self.decoder = torch.export.load(hf_hub_download(VAE, "decoder.pt2")).module().to(self.device, self.vae_dtype)
+        self.encoder = (
+            torch.export.load(hf_hub_download(self.vae, "encoder.pt2")).module().to(self.device, self.vae_dtype)
+        )
+        self.decoder = (
+            torch.export.load(hf_hub_download(self.vae, "decoder.pt2")).module().to(self.device, self.vae_dtype)
+        )
         self.model = importer.load_pickle("model", "model.pkl")
         state = torch.load(
             io.BytesIO(importer.load_binary("assets", "state_dict.pt")),
@@ -106,6 +112,7 @@ class RuntimeClient:
         self.future_frames = int(health["future_frames"])
         self.context_frames = int(health["context_frames"])
         self.history_frames = int(health["history_frames"])
+        self.vae = str(health["vae"])
 
     def _call(
         self,
@@ -171,10 +178,10 @@ def _tensor_response(**tensors: torch.Tensor) -> Response:
     return Response(body, media_type=MEDIA_TYPE)
 
 
-def create_app(model: Path = MODEL, device: str = "cuda") -> FastAPI:
+def create_app(model: Path = MODEL, vae: str = VAE, device: str = "cuda") -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.runtime = Runtime(model, device)
+        app.state.runtime = Runtime(model, vae, device)
         yield
 
     api = FastAPI(title="World-model Runtime", lifespan=lifespan)
@@ -188,6 +195,8 @@ def create_app(model: Path = MODEL, device: str = "cuda") -> FastAPI:
             "future_frames": runtime.future_frames,
             "context_frames": runtime.context_frames,
             "history_frames": runtime.history_frames,
+            "model": str(runtime.model_path),
+            "vae": str(runtime.vae),
         }
 
     @api.post("/encode")
@@ -230,11 +239,12 @@ app = create_app()
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("model", nargs="?", type=Path, default=MODEL, help="local world-model .torchpackage")
+    parser.add_argument("--vae", default=VAE, help="Hugging Face VAE repo")
     parser.add_argument("--device", default="cuda", help="PyTorch CUDA device")
     parser.add_argument("--host", default=HOST, help="listen address")
     parser.add_argument("--port", type=int, default=PORT, help="listen port")
     args = parser.parse_args()
-    uvicorn.run(create_app(args.model, args.device), host=args.host, port=args.port)
+    uvicorn.run(create_app(args.model, args.vae, args.device), host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

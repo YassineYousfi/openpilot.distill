@@ -6,12 +6,12 @@ readme = "README.md"
 requires-python = ">=3.12.3,<3.13"
 license = {text = "MIT"}
 dependencies = [
-  "av",
   "comma-deps-raylib",
   "dill",
   "einops>=0.8",
   "fastapi",
   "huggingface-hub",
+  "laika @ git+https://github.com/commaai/laika@a73329b819e2e1ab270a50b40e469ed2111845d3",
   "numpy>=2.0",
   "opencv-python-headless",
   "openpilot @ https://github.com/commaai/openpilot/archive/084747c75d2cbd23af65ab7a9e770bbd7b98bac9.tar.gz",
@@ -21,11 +21,13 @@ dependencies = [
   "spmd-types==0.2.1",
   "torch==2.13.0",
   "torchao",
-  "torchtitan",
   "torchvision",
   "uvicorn",
+  "wandb",
   "timm >=0.9.8",
   "reverse_geocoder",
+  "onnx>=1.22.0",
+  "onnxruntime-gpu",
 ]
 
 [dependency-groups]
@@ -35,12 +37,6 @@ dev = [
 
 [tool.uv]
 package = false
-
-[tool.uv.sources]
-torchtitan = { workspace = true }
-
-[tool.uv.workspace]
-members = ["torchtitan"]
 
 [tool.ruff]
 line-length = 120

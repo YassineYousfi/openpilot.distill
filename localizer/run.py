@@ -1,13 +1,11 @@
 import argparse
 from pathlib import Path
 
-import numpy as np
 from openpilot.tools.lib.logreader import LogReader
-from safetensors.numpy import load_file, save_file
+from safetensors.numpy import save_file
 
 from .localizer import localize
 from .logs import FRAME_INFO_METADATA, read_log
-from .math import interpolate, nlerp_quaternions
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SEGMENT = "2333e255f1de1fe83ea5975b24a3cc67"
