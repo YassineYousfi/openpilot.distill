@@ -58,8 +58,6 @@ def main() -> None:
         cache_dir=args.cache_dir,
     )
     last_start = len(episode.latents) - runtime.future_frames - rollout_frames
-    if last_start < runtime.history_frames:
-        raise ValueError("episode is too short for this rollout")
     actor = SupercomboActor.from_torch_checkpoint(args.model, on_policy=args.on_policy, device=device)
     supercombo = actor.model.model
     supercombo.requires_grad_(False).eval()
@@ -99,8 +97,6 @@ def main() -> None:
             rollout_inputs[ModelInputs.ACTION_T].append(model_input[ModelInputs.ACTION_T])
 
             plan = np.asarray(plan)
-            if plan.shape != (len(T_IDXS), 15):
-                raise ValueError(f"expected a {len(T_IDXS)}x15 plan, got {plan.shape}")
             action_t = model_input[ModelInputs.ACTION_T][0, -1]
             speed = max(float(plan[0, Plan.VELOCITY.start]), MIN_SPEED)
             curvature = get_curvature_from_plan(
@@ -121,8 +117,6 @@ def main() -> None:
                 raise ValueError(f"world-model plan produced a non-finite target: {target_action.tolist()}")
             target_actions.append(target_action)
 
-        if not target_actions:
-            raise RuntimeError("rollout has no trainable samples; Supercombo needs at least two environment steps")
         inputs = {name: torch.cat(values) for name, values in rollout_inputs.items()}
         targets = torch.stack(target_actions)
 
