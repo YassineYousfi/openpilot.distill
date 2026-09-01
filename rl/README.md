@@ -1,5 +1,7 @@
 # Reinforcement learning
 
+The world model is running in a FastAPI inference server.
+
 ## Interactive
 
 Terminal 1:
