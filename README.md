@@ -19,6 +19,8 @@ Run the localizer.
 
 Train a smaller driving model using the localized targets, and distillation targets from the openpilot model.
 
+<img width="1366" height="777" alt="Screenshot from 2026-08-31 17-28-31" src="https://github.com/user-attachments/assets/d53a1e0e-3b79-4923-a777-9368c34234ed" />
+
 https://api.wandb.ai/links/yassiney/qme6ln4z
 
 ## Step 3: Fine tune the driving model in the simulator
