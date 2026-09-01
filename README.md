@@ -26,6 +26,6 @@ https://api.wandb.ai/links/yassiney/qme6ln4z
 
 DAgger style post-training in a learned world model as a simulator.
 
-https://github.com/user-attachments/assets/c5614022-7979-4a5d-9624-c3743c6447a9
+https://github.com/user-attachments/assets/45ba3950-9a90-45c2-af15-f7e55f87785e
 
 Have fun!
