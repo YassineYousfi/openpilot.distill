@@ -2,6 +2,10 @@
 
 The world model is running in a FastAPI inference server.
 
+```bash
+uv run hf download commaai/worldmodel-4B model.fp8_nvfp4.torchpackage --local-dir models
+```
+
 ## Interactive
 
 Terminal 1:

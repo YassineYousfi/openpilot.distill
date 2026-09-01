@@ -1,4 +1,4 @@
-# openpilot.distill
+# 🌰 openpilot.distill
 
 You too, can train state-of-the-art autonomous driving models!
 

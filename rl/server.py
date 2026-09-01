@@ -21,9 +21,9 @@ HOST = "127.0.0.1"
 PORT = 8006
 SERVER_URL = f"http://{HOST}:{PORT}"
 MEDIA_TYPE = "application/octet-stream"
-MODEL = ROOT / "models/no_future_model.fp8_nvfp4.torchpackage"
+MODEL = ROOT / "models/model.fp8_nvfp4.torchpackage"
 VAE = "commaai/vit-ae-2x-f8c32"
-FUTURE_FRAMES = 0
+FUTURE_FRAMES = 5
 
 
 class Runtime:
