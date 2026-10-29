@@ -20,7 +20,7 @@ def decode_frames(
     gpu_id: int = 0,
     fs=None,
 ) -> dict[int, np.ndarray]:
-    """Decode selected RGB frames with NVDEC, reading only the required file prefix."""
+    """Decode selected RGB frames with NVDEC, reading only the GOPs that contain them."""
 
     wanted = {int(frame) for frame in wanted}
     if not wanted:
@@ -29,15 +29,22 @@ def decode_frames(
     if min(wanted) < 0 or max(wanted) >= frame_count:
         raise IndexError(f"wanted frames must be between 0 and {frame_count - 1}")
 
-    iframe_indexes = np.flatnonzero(index[:-1, 0] == 2)
-    next_iframe = np.searchsorted(iframe_indexes, max(wanted), side="right")
-    read_end = int(iframe_indexes[next_iframe]) if next_iframe < len(iframe_indexes) else frame_count
-    byte_count = int(index[read_end, 1])
+    gop_starts = np.union1d([0], np.flatnonzero(index[:-1, 0] == 2))
+    gops = np.unique(np.searchsorted(gop_starts, list(wanted), side="right") - 1)
+    if index[0, 1] == 0:
+        gops = np.arange(gops[-1] + 1)
+    gop_bounds = np.append(gop_starts, frame_count)
+    byte_ranges = [] if gops[0] == 0 else [(0, int(index[0, 1]))]
+    byte_ranges += [(int(index[gop_bounds[gop], 1]) if gop else 0, int(index[gop_bounds[gop + 1], 1])) for gop in gops]
     if fs is None:
+        packets = []
         with Path(path).open("rb") as video:
-            payload = video.read(byte_count)
+            for start, end in byte_ranges:
+                video.seek(start)
+                packets.append(video.read(end - start))
     else:
-        payload = fs.cat_file(str(path), end=byte_count)
+        packets = [fs.cat_file(str(path), start=start, end=end) for start, end in byte_ranges]
+    frame_numbers = iter([frame for gop in gops for frame in range(gop_bounds[gop], gop_bounds[gop + 1])])
 
     decoder = PyNvVideoCodec.CreateDecoder(
         gpuid=gpu_id,
@@ -46,16 +53,15 @@ def decode_frames(
         outputColorType=PyNvVideoCodec.OutputColorType.RGB,
     )
     decoded = {}
-    frame_index = 0
-    for packet in (payload, b""):
+    for packet in (*packets, b""):
         packet_array = np.frombuffer(packet, dtype=np.uint8)
         packet_data = PyNvVideoCodec.PacketData()
         packet_data.bsl = len(packet)
         packet_data.bsl_data = packet_array.ctypes.data
         for frame in decoder.Decode(packet_data):
+            frame_index = next(frame_numbers, None)
             if frame_index in wanted:
                 decoded[frame_index] = np.from_dlpack(frame).copy()
-            frame_index += 1
 
     missing = wanted - decoded.keys()
     if missing:
